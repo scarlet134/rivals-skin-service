@@ -1,0 +1,24 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import sharp from 'sharp';
+import {createSkinServer} from '../server.mjs';
+test('ready-made PNG is served byte-for-byte, with limits and no recoloring',async(t)=>{
+ const server=createSkinServer();await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>server.close());const base='http://127.0.0.1:'+server.address().port;
+ const health=await(await fetch(base+'/health')).json();assert.equal(health.version,2);assert.equal(health.upload_api,1);
+ const png=await sharp({create:{width:512,height:512,channels:4,background:{r:20,g:90,b:40,alpha:0.8}}}).png().toBuffer();
+ const post=await fetch(base+'/api/tee',{method:'POST',headers:{'Content-Type':'image/png'},body:png});assert.equal(post.status,200);const result=await post.json();
+ const hash=createHash('sha256').update(png).digest('hex');assert.equal(result.image,'/tee/'+hash+'.png');
+ const img=await fetch(base+result.image);assert.equal(img.status,200);assert.equal(img.headers.get('content-type'),'image/png');assert.deepEqual(Buffer.from(await img.arrayBuffer()),png);
+ const head=await fetch(base+result.image,{method:'HEAD'});assert.equal(head.status,200);assert.equal((await head.arrayBuffer()).byteLength,0);
+ assert.equal((await fetch(base+result.image,{headers:{'If-None-Match':img.headers.get('etag')}})).status,304);
+ assert.equal((await fetch(base+'/tee/'+'0'.repeat(64)+'.png')).status,404);
+ assert.equal((await fetch(base+'/api/tee')).status,405);
+ assert.equal((await fetch(base+'/api/tee',{method:'POST',headers:{'Content-Type':'text/plain'},body:'text'})).status,415);
+ assert.equal((await fetch(base+'/api/tee',{method:'POST',headers:{'Content-Type':'image/png'},body:Buffer.from('not PNG')})).status,400);
+ const tooSmall=await sharp({create:{width:256,height:256,channels:4,background:'red'}}).png().toBuffer();
+ assert.equal((await fetch(base+'/api/tee',{method:'POST',headers:{'Content-Type':'image/png'},body:tooSmall})).status,400);
+ const rgb=await sharp({create:{width:512,height:512,channels:3,background:'red'}}).png().toBuffer();
+ assert.equal((await fetch(base+'/api/tee',{method:'POST',headers:{'Content-Type':'image/png'},body:rgb})).status,400);
+ assert.equal((await fetch(base+'/api/tee',{method:'POST',headers:{'Content-Type':'image/png'},body:Buffer.alloc(512*1024+1)})).status,413);
+});

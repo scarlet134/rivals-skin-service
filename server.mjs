@@ -3,6 +3,7 @@ import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { renderSkin } from './renderer.mjs';
+import sharp from 'sharp';
 
 const PNG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const MAX_BYTES = 2 * 1024 * 1024;
@@ -70,6 +71,42 @@ export async function fetchSkin(name) {
 export function createSkinServer({ loadSkin = fetchSkin } = {}) {
   const images = new Cache(128, 24 * 1024 * 1024);
   const sources = new Cache(48, 12 * 1024 * 1024);
+  // Ready-made tee PNGs are served byte-for-byte. No atlas rendering or recoloring here.
+  // Storage is bounded RAM, not a promise of durable hosting.
+  const tees = new Cache(96, 24 * 1024 * 1024);
+  let activeUploads = 0;
+  let uploadTokens = 12;
+  let tokenTime = Date.now();
+  function allowUpload() {
+    const now = Date.now();
+    uploadTokens = Math.min(12, uploadTokens + Math.max(0, now - tokenTime) / 5000);
+    tokenTime = now;
+    if (uploadTokens < 1) return false;
+    uploadTokens -= 1; return true;
+  }
+  async function receiveTee(req) {
+    if ((req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase() !== 'image/png')
+      throw new HttpError(415, 'Only image/png is accepted');
+    const length = req.headers['content-length'];
+    if (length && (!/^\d+$/.test(length) || Number(length) > 512 * 1024))
+      throw new HttpError(413, 'PNG exceeds 512 KiB');
+    const chunks = []; let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > 512 * 1024) throw new HttpError(413, 'PNG exceeds 512 KiB');
+      chunks.push(chunk);
+    }
+    const png = Buffer.concat(chunks);
+    if (png.length < 45 || !png.subarray(0, 8).equals(PNG)) throw new HttpError(400, 'Invalid PNG');
+    try {
+      const meta = await sharp(png, { limitInputPixels: 512 * 512, failOn: 'error' }).metadata();
+      if (meta.format !== 'png' || meta.width !== 512 || meta.height !== 512 || !meta.hasAlpha || (meta.pages ?? 1) > 1)
+        throw new Error('Expected one 512x512 RGBA image');
+      // Decode to verify integrity, but do NOT re-encode/resize/recolor the supplied PNG.
+      await sharp(png, { limitInputPixels: 512 * 512, failOn: 'error' }).raw().toBuffer();
+    } catch { throw new HttpError(400, 'Expected a valid single-frame 512x512 PNG with alpha'); }
+    return png;
+  }
   const pending = new Map(); const loading = new Map();
   const getSource = async name => {
     const hit = sources.get(name); if (hit) return hit;
@@ -82,12 +119,39 @@ export function createSkinServer({ loadSkin = fetchSkin } = {}) {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
     try {
-      if (!['GET', 'HEAD'].includes(req.method)) { res.setHeader('Allow', 'GET, HEAD'); throw new HttpError(405, 'Read-only service'); }
       if (!req.url || req.url.length > 1024) throw new HttpError(414, 'URL too long');
       const url = new URL(req.url, 'http://localhost');
+      if (url.pathname === '/api/tee') {
+        if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); throw new HttpError(405, 'Use POST image/png'); }
+        if (url.search) throw new HttpError(400, 'No upload query parameters');
+        if (activeUploads >= 2 || !allowUpload()) { res.setHeader('Retry-After', '5'); throw new HttpError(429, 'Upload limit reached; retry later'); }
+        activeUploads++;
+        try {
+          const png = await receiveTee(req);
+          const hash = createHash('sha256').update(png).digest('hex');
+          tees.set(hash, png, png.length);
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.setHeader('Cache-Control', 'no-store');
+          res.end(JSON.stringify({ ok: true, image: '/tee/' + hash + '.png', sha256: hash, expires_in: 21600, storage: 'memory' }));
+        } finally { activeUploads--; }
+        return;
+      }
+      if (!['GET', 'HEAD'].includes(req.method)) { res.setHeader('Allow', 'GET, HEAD'); throw new HttpError(405, 'Use GET or HEAD'); }
+      if (url.pathname.startsWith('/tee/')) {
+        const match = /^\/tee\/([a-f0-9]{64})\.png$/.exec(url.pathname);
+        if (!match) throw new HttpError(404, 'Not found');
+        const png = tees.get(match[1]);
+        if (!png) throw new HttpError(404, 'PNG expired; client must upload it again');
+        const etag = '"' + match[1] + '"';
+        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+        res.setHeader('ETag', etag);
+        if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
+        res.setHeader('Content-Type', 'image/png'); res.setHeader('Content-Length', png.length);
+        res.end(req.method === 'HEAD' ? undefined : png); return;
+      }
       if (['/', '/health', '/healthz'].includes(url.pathname)) {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ ok: true, service: 'RIVALS skin service', version: 1, example: '/skin.png?name=default', privacy: 'Only a skin name and optional colors. No uploads, nicknames or server addresses.' })); return;
+        res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ ok: true, service: 'RIVALS skin service', version: 2, upload_api: 1, storage: 'memory', example: '/skin.png?name=default', privacy: 'Client may upload a 512x512 tee-only PNG. No screenshots, nicknames or server addresses are required.' })); return;
       }
       if (url.pathname !== '/skin.png') throw new HttpError(404, 'Not found');
       const opts = parseOptions(url); const key = JSON.stringify(opts);
@@ -110,7 +174,9 @@ export function createSkinServer({ loadSkin = fetchSkin } = {}) {
       res.setHeader('Content-Type', 'image/png'); res.setHeader('Content-Length', image.data.length);
       res.end(req.method === 'HEAD' ? undefined : image.data);
     } catch (err) {
+      if (res.destroyed) return;
       res.statusCode = err.status ?? 502;
+      if (req.method === 'POST') res.setHeader('Connection', 'close');
       res.setHeader('Cache-Control', 'no-store'); res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ error: err.status ? err.message : 'Unable to render this skin' }));
     }
