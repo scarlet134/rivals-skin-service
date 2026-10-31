@@ -1,0 +1,11 @@
+{
+  "name": "rivals-skin-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bounded, read-only DDNet 0.6 skin renderer for RIVALS Discord presence",
+  "license": "GPL-3.0-or-later",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node server.mjs", "test": "node --test test/*.test.mjs" },
+  "dependencies": { "sharp": "0.34.5" }
+}
